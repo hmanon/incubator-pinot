@@ -31,9 +31,11 @@ import java.nio.file.FileSystems;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 
+import java.util.Map;
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
@@ -50,6 +52,7 @@ import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.apache.pinot.common.utils.StringUtil;
 import org.apache.pinot.common.utils.TarGzCompressionUtils;
 import org.apache.pinot.common.segment.generation.SegmentGenerationUtils;
+import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationJobUtils;
 import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.filesystem.PinotFSFactory;
@@ -218,15 +221,27 @@ public class HadoopSegmentGenerationJobRunner extends Configured implements Inge
       throw new RuntimeException(errorMessage);
     } else {
       LOGGER.info("Creating segments with data files: {}", filteredFiles);
-      for (int i = 0; i < numDataFiles; i++) {
-        // Typically PinotFS implementations list files without a protocol, so we lose (for example) the
-        // hdfs:// portion of the path. Call getFileURI() to fix this up.
-        URI inputFileURI = SegmentGenerationUtils.getFileURI(filteredFiles.get(i), inputDirURI);
-        File localFile = File.createTempFile("pinot-filepath-", ".txt");
-        try (DataOutputStream dataOutputStream = new DataOutputStream(new FileOutputStream(localFile))) {
-          dataOutputStream.write(StringUtil.encodeUtf8(inputFileURI + " " + i));
-          dataOutputStream.flush();
-          outputDirFS.copyFromLocalFile(localFile, new Path(stagingInputDir, Integer.toString(i)).toUri());
+      if (SegmentGenerationJobUtils.useLocalDirectorySequenceId(_spec.getSegmentNameGeneratorSpec())) {
+        Map<String, List<String>> localDirIndex = new HashMap<>();
+        for (String filteredFile : filteredFiles) {
+          java.nio.file.Path filteredParentPath = Paths.get(filteredFile).getParent();
+          if (!localDirIndex.containsKey(filteredParentPath.toString())) {
+            localDirIndex.put(filteredParentPath.toString(), new ArrayList<>());
+          }
+          localDirIndex.get(filteredParentPath.toString()).add(filteredFile);
+        }
+        for (String parentPath : localDirIndex.keySet()) {
+          List<String> siblingFiles = localDirIndex.get(parentPath);
+          Collections.sort(siblingFiles);
+          for (int i = 0; i < siblingFiles.size(); i++) {
+            URI inputFileURI = SegmentGenerationUtils.getFileURI(siblingFiles.get(i), URI.create(parentPath));
+            createInputFileUriAndSeqIdFile(inputFileURI, outputDirFS, stagingInputDir, i);
+          }
+        }
+      } else {
+        for (int i = 0; i < numDataFiles; i++) {
+          URI inputFileURI = SegmentGenerationUtils.getFileURI(filteredFiles.get(i), inputDirURI);
+          createInputFileUriAndSeqIdFile(inputFileURI, outputDirFS, stagingInputDir, i);
         }
       }
     }
@@ -305,6 +320,18 @@ public class HadoopSegmentGenerationJobRunner extends Configured implements Inge
     } finally {
       LOGGER.info("Trying to clean up staging directory: [{}]", stagingDirURI);
       outputDirFS.delete(stagingDirURI, true);
+    }
+  }
+
+  private void createInputFileUriAndSeqIdFile(URI inputFileURI, PinotFS outputDirFS, Path stagingInputDir, int seqId)
+      throws Exception {
+    // Typically PinotFS implementations list files without a protocol, so we lose (for example) the
+    // hdfs:// portion of the path. Call getFileURI() to fix this up.
+    File localFile = File.createTempFile("pinot-filepath-", ".txt");
+    try (DataOutputStream dataOutputStream = new DataOutputStream(new FileOutputStream(localFile))) {
+      dataOutputStream.write(StringUtil.encodeUtf8(inputFileURI + " " + seqId));
+      dataOutputStream.flush();
+      outputDirFS.copyFromLocalFile(localFile, new Path(stagingInputDir, Integer.toString(seqId)).toUri());
     }
   }
 

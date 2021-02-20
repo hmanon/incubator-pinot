@@ -25,16 +25,19 @@ import java.nio.file.FileSystems;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
-
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.commons.io.FileUtils;
-import org.apache.pinot.common.utils.TarGzCompressionUtils;
-import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationTaskRunner;
 import org.apache.pinot.common.segment.generation.SegmentGenerationUtils;
+import org.apache.pinot.common.utils.TarGzCompressionUtils;
+import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationJobUtils;
+import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationTaskRunner;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.data.Schema;
 import org.apache.pinot.spi.env.PinotConfiguration;
@@ -170,62 +173,39 @@ public class SegmentGenerationJobRunner implements IngestionJobRunner {
 
       int numInputFiles = filteredFiles.size();
       CountDownLatch segmentCreationTaskCountDownLatch = new CountDownLatch(numInputFiles);
-      //iterate on the file list, for each
-      for (int i = 0; i < numInputFiles; i++) {
-        final URI inputFileURI = SegmentGenerationUtils.getFileURI(filteredFiles.get(i), inputDirURI);
+      //create task spec
+      SegmentGenerationTaskSpec taskSpec = new SegmentGenerationTaskSpec();
+      taskSpec.setOutputDirectoryPath(localOutputTempDir.getAbsolutePath());
+      taskSpec.setRecordReaderSpec(_spec.getRecordReaderSpec());
+      taskSpec.setSchema(schema);
+      taskSpec.setTableConfig(tableConfig);
+      taskSpec.setSegmentNameGeneratorSpec(_spec.getSegmentNameGeneratorSpec());
 
-        //copy input path to local
-        File localInputDataFile = new File(localInputTempDir, new File(inputFileURI.getPath()).getName());
-        inputDirFS.copyToLocalFile(inputFileURI, localInputDataFile);
-
-        //create task spec
-        SegmentGenerationTaskSpec taskSpec = new SegmentGenerationTaskSpec();
-        taskSpec.setInputFilePath(localInputDataFile.getAbsolutePath());
-        taskSpec.setOutputDirectoryPath(localOutputTempDir.getAbsolutePath());
-        taskSpec.setRecordReaderSpec(_spec.getRecordReaderSpec());
-        taskSpec.setSchema(schema);
-        taskSpec.setTableConfig(tableConfig);
-        taskSpec.setSequenceId(i);
-        taskSpec.setSegmentNameGeneratorSpec(_spec.getSegmentNameGeneratorSpec());
-        taskSpec.setCustomProperty(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY, inputFileURI.toString());
-
-        LOGGER.info("Submitting one Segment Generation Task for {}", inputFileURI);
-        _executorService.submit(() -> {
-          File localSegmentDir = null;
-          File localSegmentTarFile = null;
-          try {
-            //invoke segmentGenerationTask
-            SegmentGenerationTaskRunner taskRunner = new SegmentGenerationTaskRunner(taskSpec);
-            String segmentName = taskRunner.run();
-            // Tar segment directory to compress file
-            localSegmentDir = new File(localOutputTempDir, segmentName);
-            String segmentTarFileName = URLEncoder.encode(segmentName + Constants.TAR_GZ_FILE_EXT, "UTF-8");
-            localSegmentTarFile = new File(localOutputTempDir, segmentTarFileName);
-            LOGGER.info("Tarring segment from: {} to: {}", localSegmentDir, localSegmentTarFile);
-            TarGzCompressionUtils.createTarGzFile(localSegmentDir, localSegmentTarFile);
-            long uncompressedSegmentSize = FileUtils.sizeOf(localSegmentDir);
-            long compressedSegmentSize = FileUtils.sizeOf(localSegmentTarFile);
-            LOGGER.info("Size for segment: {}, uncompressed: {}, compressed: {}", segmentName,
-                DataSizeUtils.fromBytes(uncompressedSegmentSize), DataSizeUtils.fromBytes(compressedSegmentSize));
-            //move segment to output PinotFS
-            URI outputSegmentTarURI =
-                SegmentGenerationUtils.getRelativeOutputPath(inputDirURI, inputFileURI, outputDirURI)
-                    .resolve(segmentTarFileName);
-            if (!_spec.isOverwriteOutput() && outputDirFS.exists(outputSegmentTarURI)) {
-              LOGGER
-                  .warn("Not overwrite existing output segment tar file: {}", outputDirFS.exists(outputSegmentTarURI));
-            } else {
-              outputDirFS.copyFromLocalFile(localSegmentTarFile, outputSegmentTarURI);
-            }
-          } catch (Exception e) {
-            LOGGER.error("Failed to generate Pinot segment for file - {}", inputFileURI, e);
-          } finally {
-            segmentCreationTaskCountDownLatch.countDown();
-            FileUtils.deleteQuietly(localSegmentDir);
-            FileUtils.deleteQuietly(localSegmentTarFile);
-            FileUtils.deleteQuietly(localInputDataFile);
+      if (SegmentGenerationJobUtils.useLocalDirectorySequenceId(_spec.getSegmentNameGeneratorSpec())) {
+        Map<String, List<String>> localDirIndex = new HashMap<>();
+        for (String filteredFile : filteredFiles) {
+          java.nio.file.Path filteredParentPath = Paths.get(filteredFile).getParent();
+          if (!localDirIndex.containsKey(filteredParentPath.toString())) {
+            localDirIndex.put(filteredParentPath.toString(), new ArrayList<>());
           }
-        });
+          localDirIndex.get(filteredParentPath.toString()).add(filteredFile);
+        }
+        for (String parentPath : localDirIndex.keySet()) {
+          List<String> siblingFiles = localDirIndex.get(parentPath);
+          Collections.sort(siblingFiles);
+          for (int i = 0; i < siblingFiles.size(); i++) {
+            URI inputFileURI = SegmentGenerationUtils.getFileURI(siblingFiles.get(i), URI.create(parentPath));
+            submitSegmentGenTask(inputDirFS, outputDirFS, inputDirURI, outputDirURI, localInputTempDir,
+                localOutputTempDir, taskSpec, inputFileURI, i, segmentCreationTaskCountDownLatch);
+          }
+        }
+      } else {
+        //iterate on the file list, for each
+        for (int i = 0; i < numInputFiles; i++) {
+          final URI inputFileURI = SegmentGenerationUtils.getFileURI(filteredFiles.get(i), inputDirURI);
+          submitSegmentGenTask(inputDirFS, outputDirFS, inputDirURI, outputDirURI, localInputTempDir,
+              localOutputTempDir, taskSpec, inputFileURI, i, segmentCreationTaskCountDownLatch);
+        }
       }
       segmentCreationTaskCountDownLatch.await();
     } finally {
@@ -233,5 +213,55 @@ public class SegmentGenerationJobRunner implements IngestionJobRunner {
       FileUtils.deleteQuietly(localTempDir);
       _executorService.shutdown();
     }
+  }
+
+  private void submitSegmentGenTask(PinotFS inputDirFS, PinotFS outputDirFS, URI inputDirURI, URI outputDirURI,
+      File localInputTempDir, File localOutputTempDir, SegmentGenerationTaskSpec taskSpec, URI inputFileURI, int seqId,
+      CountDownLatch segmentCreationTaskCountDownLatch)
+      throws Exception {
+    //copy input path to local
+    File localInputDataFile = new File(localInputTempDir, new File(inputFileURI.getPath()).getName());
+    inputDirFS.copyToLocalFile(inputFileURI, localInputDataFile);
+
+    //Update task spec
+    taskSpec.setInputFilePath(localInputDataFile.getAbsolutePath());
+    taskSpec.setSequenceId(seqId);
+    taskSpec.setCustomProperty(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY, inputFileURI.toString());
+
+    LOGGER.info("Submitting one Segment Generation Task for {}", inputFileURI);
+    _executorService.submit(() -> {
+      File localSegmentDir = null;
+      File localSegmentTarFile = null;
+      try {
+        //invoke segmentGenerationTask
+        SegmentGenerationTaskRunner taskRunner = new SegmentGenerationTaskRunner(taskSpec);
+        String segmentName = taskRunner.run();
+        // Tar segment directory to compress file
+        localSegmentDir = new File(localOutputTempDir, segmentName);
+        String segmentTarFileName = URLEncoder.encode(segmentName + Constants.TAR_GZ_FILE_EXT, "UTF-8");
+        localSegmentTarFile = new File(localOutputTempDir, segmentTarFileName);
+        LOGGER.info("Tarring segment from: {} to: {}", localSegmentDir, localSegmentTarFile);
+        TarGzCompressionUtils.createTarGzFile(localSegmentDir, localSegmentTarFile);
+        long uncompressedSegmentSize = FileUtils.sizeOf(localSegmentDir);
+        long compressedSegmentSize = FileUtils.sizeOf(localSegmentTarFile);
+        LOGGER.info("Size for segment: {}, uncompressed: {}, compressed: {}", segmentName,
+            DataSizeUtils.fromBytes(uncompressedSegmentSize), DataSizeUtils.fromBytes(compressedSegmentSize));
+        //move segment to output PinotFS
+        URI outputSegmentTarURI = SegmentGenerationUtils.getRelativeOutputPath(inputDirURI, inputFileURI, outputDirURI)
+            .resolve(segmentTarFileName);
+        if (!_spec.isOverwriteOutput() && outputDirFS.exists(outputSegmentTarURI)) {
+          LOGGER.warn("Not overwrite existing output segment tar file: {}", outputDirFS.exists(outputSegmentTarURI));
+        } else {
+          outputDirFS.copyFromLocalFile(localSegmentTarFile, outputSegmentTarURI);
+        }
+      } catch (Exception e) {
+        LOGGER.error("Failed to generate Pinot segment for file - {}", inputFileURI, e);
+      } finally {
+        segmentCreationTaskCountDownLatch.countDown();
+        FileUtils.deleteQuietly(localSegmentDir);
+        FileUtils.deleteQuietly(localSegmentTarFile);
+        FileUtils.deleteQuietly(localInputDataFile);
+      }
+    });
   }
 }
